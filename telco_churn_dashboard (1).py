@@ -117,7 +117,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         df["TotalCharges"] = df["TotalCharges"].ffill()
         df["TotalCharges"] = df["TotalCharges"].fillna(df["TotalCharges"].median())
 
-    if "SeniorCitizen" in df.columns and df["SeniorCitizen"].dtype != object:
+    if "SeniorCitizen" in df.columns and pd.api.types.is_numeric_dtype(df["SeniorCitizen"]):
         df["SeniorCitizen"] = df["SeniorCitizen"].map({0: "No", 1: "Yes"}).fillna(
             df["SeniorCitizen"]
         )
@@ -126,8 +126,12 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_feature_groups(df: pd.DataFrame, id_col="customerID", target_col="Churn"):
+    """Split feature columns by dtype (not by how many unique values they have) —
+    any non-numeric column must be label-encoded, no matter its cardinality.
+    Uses is_numeric_dtype rather than checking for `object` specifically, since
+    pandas 3.0+ stores text as a dedicated `str` dtype rather than `object`."""
     cols = [c for c in df.columns if c not in (id_col, target_col)]
-    categorical = [c for c in cols if df[c].nunique() <= 6 and df[c].dtype == object]
+    categorical = [c for c in cols if not pd.api.types.is_numeric_dtype(df[c])]
     numeric = [c for c in cols if c not in categorical]
     return categorical, numeric
 
@@ -317,6 +321,32 @@ if scale_cols:
 X = enc_df_scaled[model_feature_cols]
 y = enc_df_scaled["Churn"]
 
+# Force every feature to a plain numeric dtype. This protects against stray
+# non-numeric values, pandas extension dtypes (nullable Int64, Arrow-backed
+# strings, etc.), or anything upstream that slipped past the categorical/
+# numeric split — the model libraries need a plain float/int numpy array,
+# and Streamlit Cloud otherwise hides the real error message.
+bad_cols = {}
+for col in model_feature_cols:
+    coerced = pd.to_numeric(X[col], errors="coerce")
+    if coerced.isna().any() and not X[col].isna().any():
+        bad_values = X.loc[coerced.isna(), col].unique()[:5]
+        bad_cols[col] = bad_values
+    X[col] = coerced
+
+if bad_cols:
+    st.error(
+        "Some columns contain values that couldn't be converted to numbers "
+        "after encoding, which will break model training:\n\n"
+        + "\n".join(f"- **{c}**: e.g. {list(v)}" for c, v in bad_cols.items())
+        + "\n\nCheck these columns in your CSV for stray text, symbols, or "
+        "inconsistent formatting."
+    )
+    st.stop()
+
+X = X.fillna(X.median(numeric_only=True))
+y = pd.to_numeric(y, errors="coerce").astype(int)
+
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=test_size, stratify=y, random_state=random_state
 )
@@ -483,9 +513,13 @@ with tab_models:
         st.stop()
 
     if st.button("🚀 Train Models", type="primary"):
-        st.session_state["trained"] = train_and_evaluate(
-            X_train, y_train, X_test, y_test, tuple(selected_models), use_smote, data_key
-        )
+        try:
+            st.session_state["trained"] = train_and_evaluate(
+                X_train, y_train, X_test, y_test, tuple(selected_models), use_smote, data_key
+            )
+        except Exception as e:
+            st.error(f"Training failed: {type(e).__name__}: {e}")
+            st.stop()
 
     if "trained" not in st.session_state:
         st.info("Click **Train Models** to fit the selected classifiers on this dataset.")
